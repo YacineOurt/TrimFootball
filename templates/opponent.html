@@ -1,0 +1,99 @@
+{% extends "base.html" %}
+{% block title %}{{ team_name }} — Rapport adversaire{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>{{ team_name }}</h1>
+    <button class="btn" onclick="window.print()">Imprimer / PDF</button>
+</div>
+
+<div class="opponent-profile card">
+    <h2>Profil tactique ({{ aggregate.n_matches }} match{{ 'es' if aggregate.n_matches > 1 else '' }})</h2>
+    <div class="metrics-grid">
+        <div class="metric-card">
+            <div class="metric-label">Formation dominante</div>
+            <div class="metric-value">{{ aggregate.dominant_formation }}</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-label">Compacité moyenne</div>
+            <div class="metric-value">{{ aggregate.avg_compactness or 'N/A' }}{% if aggregate.avg_compactness %} m²{% endif %}</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-label">Hauteur du bloc</div>
+            <div class="metric-value">{{ aggregate.avg_block_height or 'N/A' }}{% if aggregate.avg_block_height %} m{% endif %}</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-label">Largeur moyenne</div>
+            <div class="metric-value">{{ aggregate.avg_width or 'N/A' }}{% if aggregate.avg_width %} m{% endif %}</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-label">Longueur moyenne</div>
+            <div class="metric-value">{{ aggregate.avg_length or 'N/A' }}{% if aggregate.avg_length %} m{% endif %}</div>
+        </div>
+    </div>
+</div>
+
+<div class="card">
+    <h2>Matchs analysés</h2>
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>Date</th>
+                <th>Match</th>
+                <th>Score</th>
+                <th></th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for m in matches %}
+            <tr>
+                <td>{{ m.date }}</td>
+                <td>{{ m.team_home }} vs {{ m.team_away }}</td>
+                <td>{% if m.score_home is not none %}{{ m.score_home }}-{{ m.score_away }}{% else %}-{% endif %}</td>
+                <td><a href="/match/{{ m.id }}" class="btn btn-sm">Voir</a></td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+{% if aggregate.per_match|length > 1 %}
+<div class="card">
+    <h2>Tendances</h2>
+    <div id="trends-chart" style="height: 300px"></div>
+</div>
+
+<script>
+    const perMatch = {{ aggregate.per_match | tojson }};
+    const matchDates = {{ matches | map(attribute='date') | list | tojson }};
+
+    const traces = [];
+    const compactness = perMatch.map(m => m.compactness || null);
+    const blockHeight = perMatch.map(m => m.block_height || null);
+
+    if (compactness.some(v => v !== null)) {
+        traces.push({
+            x: matchDates, y: compactness,
+            name: 'Compacité (m²)', mode: 'lines+markers',
+            line: {color: '#ff6432'}
+        });
+    }
+    if (blockHeight.some(v => v !== null)) {
+        traces.push({
+            x: matchDates, y: blockHeight,
+            name: 'Hauteur bloc (m)', mode: 'lines+markers',
+            yaxis: 'y2', line: {color: '#3264ff'}
+        });
+    }
+
+    Plotly.newPlot('trends-chart', traces, {
+        template: 'plotly_dark',
+        paper_bgcolor: 'transparent', plot_bgcolor: 'transparent',
+        margin: {l: 50, r: 50, t: 10, b: 40},
+        yaxis: {title: 'Compacité (m²)', color: '#ff6432'},
+        yaxis2: {title: 'Bloc (m)', overlaying: 'y', side: 'right', color: '#3264ff'},
+        legend: {orientation: 'h', y: 1.1},
+    }, {responsive: true});
+</script>
+{% endif %}
+{% endblock %}

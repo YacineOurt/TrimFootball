@@ -1,0 +1,133 @@
+{% extends "base.html" %}
+{% block title %}{{ match.team_home }} vs {{ match.team_away }} — TrimFootball{% endblock %}
+
+{% block content %}
+<!-- Header (always shown) -->
+<div class="match-header card">
+    <div class="match-date">{{ match.date }}</div>
+    <div class="match-teams-large">
+        <span class="team-home">{{ match.team_home }}</span>
+        <span class="match-score-large">
+            {% if match.score_home is not none %}{{ match.score_home }} - {{ match.score_away }}{% else %}vs{% endif %}
+        </span>
+        <span class="team-away">{{ match.team_away }}</span>
+    </div>
+</div>
+
+{% if match.status == 'processing' %}
+<!-- Processing state -->
+<div class="card" style="text-align:center; padding:3rem" id="processing-card">
+    <div class="spinner" style="margin: 0 auto 1rem"></div>
+    <h2>Analyse en cours</h2>
+    <p style="color:var(--text-secondary); margin: 1rem 0" id="progress-message">Démarrage du pipeline...</p>
+    <div class="progress-bar-container" style="max-width:400px; margin:1rem auto; background:var(--bg-primary); border-radius:6px; height:8px; overflow:hidden">
+        <div id="progress-bar" style="height:100%; width:0%; background:var(--accent); transition:width 0.3s"></div>
+    </div>
+    <p style="color:var(--text-secondary); font-size:0.85rem; margin-top:1.5rem">
+        Vous pouvez fermer cette page, l'analyse continue en arrière-plan.
+    </p>
+</div>
+<script>
+    async function pollStatus() {
+        const resp = await fetch('/api/match/{{ match.id }}/status');
+        const data = await resp.json();
+        if (data.status === 'ready') {
+            window.location.reload();
+            return;
+        }
+        if (data.status === 'error') {
+            document.getElementById('progress-message').textContent = 'Erreur lors de l\'analyse.';
+            document.querySelector('.spinner').style.display = 'none';
+            document.getElementById('progress-bar').style.background = '#e55';
+            return;
+        }
+        if (data.progress) {
+            document.getElementById('progress-message').textContent = data.progress.message || 'Analyse...';
+            const step = data.progress.step || 1;
+            const pct = data.progress.progress || 0;
+            const total = ((step - 1) * 50) + (pct * 50);
+            document.getElementById('progress-bar').style.width = total + '%';
+        }
+        setTimeout(pollStatus, 2000);
+    }
+    pollStatus();
+</script>
+
+{% elif match.status == 'error' %}
+<!-- Error state -->
+<div class="card" style="text-align:center; padding:3rem">
+    <h2 style="color:#e55">Erreur d'analyse</h2>
+    <p style="color:var(--text-secondary); margin: 1rem 0">Le pipeline a rencontré une erreur.</p>
+    <a href="/" class="btn" style="margin-top:0.5rem">Retour aux matchs</a>
+</div>
+
+{% elif match.status == 'ready' %}
+<!-- Ready state — full dashboard -->
+<div id="loading" class="loading-overlay">
+    <div class="spinner"></div>
+    <p>Chargement des métriques...</p>
+</div>
+
+<!-- Summary -->
+<div class="summary-section card" id="summary-section" style="display:none">
+    <h2>Résumé</h2>
+    <div id="summary-content"></div>
+</div>
+
+<!-- Video + Pitch -->
+<div class="dashboard-grid">
+    <div class="card video-section">
+        <div class="section-header">
+            <h3>Vidéo</h3>
+            <span class="time-display" id="time-display">00:00</span>
+        </div>
+        <video id="match-video" controls preload="metadata">
+            <source src="/api/match/{{ match.id }}/video" type="video/mp4">
+        </video>
+    </div>
+    <div class="card pitch-section">
+        <div class="section-header">
+            <h3>Vue tactique</h3>
+            <button class="btn btn-sm" id="export-pitch-btn" title="Télécharger PNG">Export PNG</button>
+        </div>
+        <canvas id="pitch-canvas" width="800" height="530"></canvas>
+        <div class="pitch-metrics" id="pitch-metrics"></div>
+    </div>
+</div>
+
+<!-- Key moments -->
+<div class="card" id="events-section" style="display:none">
+    <div class="section-header">
+        <h2>Moments clés</h2>
+        <span class="event-count" id="event-count"></span>
+    </div>
+    <div class="events-list" id="events-list"></div>
+</div>
+
+<!-- Charts -->
+<div class="card" id="charts-section" style="display:none">
+    <h2>Évolution temporelle</h2>
+    <div class="chart-tabs">
+        <button class="chart-tab active" data-chart="compactness">Compacité</button>
+        <button class="chart-tab" data-chart="block_height">Hauteur du bloc</button>
+        <button class="chart-tab" data-chart="width">Largeur</button>
+        <button class="chart-tab" data-chart="length">Longueur</button>
+    </div>
+    <div id="metrics-chart" style="height:300px"></div>
+</div>
+
+<script>
+    const MATCH_ID = {{ match.id }};
+</script>
+<script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
+
+{% else %}
+<!-- Pending / unknown state -->
+<div class="card" style="text-align:center; padding:3rem">
+    <h2>En attente</h2>
+    <p style="color:var(--text-secondary)">Ce match n'a pas encore été analysé.</p>
+    <a href="/" class="btn" style="margin-top:1rem">Retour aux matchs</a>
+</div>
+{% endif %}
+
+{% endblock %}

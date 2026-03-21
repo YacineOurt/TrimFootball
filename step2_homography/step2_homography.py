@@ -8,7 +8,12 @@ Step 2: Homography estimation via optimization
 import cv2
 import json
 import numpy as np
+from pathlib import Path
 from scipy.optimize import minimize
+
+# --- Paths ---
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = SCRIPT_DIR.parent
 
 # --- Pitch model (meters) ---
 PITCH_L = 105.0
@@ -139,18 +144,8 @@ def detect_white_lines(frame):
 
 def compute_initial_H():
     """Compute initial homography guess from the most confident correspondences."""
-    # Use approximate correspondences based on detected features:
-    # The camera is on the near side, slightly left of center, elevated.
-    # Known: halfway line at x_pixel≈1245, far touchline at y_pixel≈240
-    #
-    # Initial guess: 4 corner correspondences of the visible pitch area
-    # Adjusted initial guess based on detected features:
-    # - Halfway line at x_pixel≈1245 = x_pitch 52.5m
-    # - Far touchline at y_pixel≈240
-    # - Near touchline extrapolated
-    # - Left goal area at x_pixel≈280
     pts_pixel = np.array([
-        [250, 248],      # far-left corner (goal line × far touchline)
+        [250, 248],      # far-left corner (goal line x far touchline)
         [1850, 235],     # far-right corner
         [1920, 1070],    # near-right corner
         [50, 1060],      # near-left corner
@@ -167,16 +162,24 @@ def compute_initial_H():
     return H
 
 
-def run():
-    cap = cv2.VideoCapture("video2.mp4")
+def run(video_path=None, tracking_path=None, output_dir=None,
+        progress_callback=None):
+    video_path = video_path or str(PROJECT_DIR / "video2.mp4")
+    tracking_path = tracking_path or str(PROJECT_DIR / "tracking_data.json")
+    output_dir = Path(output_dir) if output_dir else SCRIPT_DIR
+
+    cap = cv2.VideoCapture(video_path)
     cap.set(cv2.CAP_PROP_POS_FRAMES, 270)
     ret, frame = cap.read()
     cap.release()
     h, w = frame.shape[:2]
 
+    if progress_callback:
+        progress_callback("homography", 0.1)
+
     print("1. Detecting white pitch lines...")
     white_mask = detect_white_lines(frame)
-    cv2.imwrite("white_mask_clean.jpg", white_mask)
+    cv2.imwrite(str(output_dir / "white_mask_clean.jpg"), white_mask)
     print(f"   White pixels: {(white_mask > 0).sum()}")
 
     print("2. Computing initial homography guess...")
@@ -198,7 +201,10 @@ def run():
     vis_init = frame.copy()
     proj_init = rasterize_pitch_lines(H_inv_init, w, h, pitch_lines)
     vis_init[proj_init > 0] = [0, 255, 0]
-    cv2.imwrite("homography_initial.jpg", vis_init)
+    cv2.imwrite(str(output_dir / "homography_initial.jpg"), vis_init)
+
+    if progress_callback:
+        progress_callback("homography", 0.3)
 
     print("3. Optimizing homography...")
     # Use Powell method which handles this type of problem better
@@ -231,13 +237,16 @@ def run():
     vis_opt = frame.copy()
     proj_opt = rasterize_pitch_lines(H_inv_opt, w, h, pitch_lines)
     vis_opt[proj_opt > 0] = [0, 255, 0]
-    cv2.imwrite("homography_optimized.jpg", vis_opt)
+    cv2.imwrite(str(output_dir / "homography_optimized.jpg"), vis_opt)
 
     # Save homography
-    np.save("homography.npy", H_opt)
+    np.save(str(output_dir / "homography.npy"), H_opt)
+
+    if progress_callback:
+        progress_callback("homography", 0.7)
 
     print("4. Projecting tracking data onto 2D pitch...")
-    with open("tracking_data.json") as f:
+    with open(tracking_path) as f:
         tracking = json.load(f)
 
     # Project player positions (center-bottom of bbox = feet position)
@@ -266,23 +275,28 @@ def run():
                 fd["ball"]["pitch_x"] = round(float(result_pt[0] / result_pt[2]), 1)
                 fd["ball"]["pitch_y"] = round(float(result_pt[1] / result_pt[2]), 1)
 
-    with open("tracking_data.json", "w") as f:
+    with open(tracking_path, "w") as f:
         json.dump(tracking, f)
 
     # 5. Draw one frame on 2D pitch
     print("5. Drawing 2D pitch view...")
-    draw_2d_pitch(tracking["frames"][270], H_opt)
+    draw_2d_pitch(tracking["frames"][270], output_dir)
+
+    if progress_callback:
+        progress_callback("homography", 1.0)
 
     print("\nDone! Files:")
-    print("  homography_initial.jpg  - initial guess overlay")
-    print("  homography_optimized.jpg - optimized overlay")
-    print("  pitch_2d_frame270.jpg   - 2D tactical view")
-    print("  homography.npy          - saved homography matrix")
-    print("  tracking_data.json      - updated with pitch coordinates")
+    print(f"  {output_dir / 'homography_initial.jpg'}  - initial guess overlay")
+    print(f"  {output_dir / 'homography_optimized.jpg'} - optimized overlay")
+    print(f"  {output_dir / 'pitch_2d.jpg'}            - 2D tactical view")
+    print(f"  {output_dir / 'homography.npy'}          - saved homography matrix")
+    print(f"  {tracking_path}                           - updated with pitch coordinates")
 
 
-def draw_2d_pitch(frame_data, H):
+def draw_2d_pitch(frame_data, output_dir=None):
     """Draw players on a 2D pitch diagram."""
+    output_dir = Path(output_dir) if output_dir else SCRIPT_DIR
+
     # Pitch image: 10px per meter
     scale = 10
     pw, ph = int(PITCH_L * scale), int(PITCH_W * scale)
@@ -330,7 +344,7 @@ def draw_2d_pitch(frame_data, H):
             sx, sy = m2px(bx, by)
             cv2.circle(img, (sx, sy), 4, (0, 255, 255), -1)
 
-    cv2.imwrite("pitch_2d_frame270.jpg", img)
+    cv2.imwrite(str(output_dir / "pitch_2d.jpg"), img)
 
 
 if __name__ == "__main__":

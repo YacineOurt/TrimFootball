@@ -14,13 +14,17 @@ from pathlib import Path
 from sklearn.cluster import KMeans
 from ultralytics import YOLO
 
-# --- Config ---
-VIDEO_PATH = "video2.mp4"
-PLAYERS_MODEL = "models/players_detection/best.pt"
-BALL_MODEL = "models/ball_detection/yolo-football-ball-detection.pt"
+# --- Paths ---
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = SCRIPT_DIR.parent
+
+VIDEO_PATH = str(PROJECT_DIR / "video2.mp4")
+PLAYERS_MODEL = str(PROJECT_DIR / "models/players_detection/best.pt")
+BALL_MODEL = str(PROJECT_DIR / "models/ball_detection/yolo-football-ball-detection.pt")
 CONF_THRESHOLD = 0.40
-OUTPUT_VIDEO = "output_tracking.mp4"
-OUTPUT_DATA = "tracking_data.json"
+TRACKER_CONFIG = str(SCRIPT_DIR / "custom_bytetrack.yaml")
+OUTPUT_VIDEO = str(SCRIPT_DIR / "output_tracking.mp4")
+OUTPUT_DATA = str(PROJECT_DIR / "tracking_data.json")
 
 
 def get_jersey_color(frame, bbox):
@@ -82,11 +86,16 @@ def classify_teams(track_colors):
     return team_map
 
 
-def run_tracking():
+def run_tracking(video_path=None, output_data=None, output_video=None,
+                 progress_callback=None):
+    video_path = video_path or VIDEO_PATH
+    output_data = output_data or OUTPUT_DATA
+    output_video = output_video or OUTPUT_VIDEO
+
     model_players = YOLO(PLAYERS_MODEL)
     model_ball = YOLO(BALL_MODEL)
 
-    cap = cv2.VideoCapture(VIDEO_PATH)
+    cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -106,7 +115,7 @@ def run_tracking():
 
         # Player tracking with ByteTrack (custom config for small Veo players)
         results = model_players.track(
-            frame, conf=CONF_THRESHOLD, persist=True, tracker="custom_bytetrack.yaml", verbose=False
+            frame, conf=CONF_THRESHOLD, persist=True, tracker=TRACKER_CONFIG, verbose=False
         )
 
         # Ball detection (no tracking needed - single object)
@@ -150,6 +159,8 @@ def run_tracking():
         frame_idx += 1
         if frame_idx % 100 == 0:
             print(f"  Frame {frame_idx}/{total_frames}")
+        if frame_idx % 50 == 0 and progress_callback:
+            progress_callback("tracking", frame_idx / total_frames)
 
     print(f"  Tracked {len(track_colors)} unique player IDs")
 
@@ -170,7 +181,7 @@ def run_tracking():
 
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(OUTPUT_VIDEO, fourcc, fps, (w, h))
+    out = cv2.VideoWriter(output_video, fourcc, fps, (w, h))
 
     for fd in all_frames_data:
         ret, frame = cap.read()
@@ -215,7 +226,7 @@ def run_tracking():
 
     # --- Save tracking data ---
     output = {
-        "video": VIDEO_PATH,
+        "video": video_path,
         "fps": fps,
         "resolution": [w, h],
         "total_frames": total_frames,
@@ -223,12 +234,15 @@ def run_tracking():
         "frames": all_frames_data,
     }
 
-    with open(OUTPUT_DATA, "w") as f:
+    with open(output_data, "w") as f:
         json.dump(output, f)
 
     print(f"\nDone!")
-    print(f"  Video: {OUTPUT_VIDEO}")
-    print(f"  Data:  {OUTPUT_DATA}")
+    print(f"  Video: {output_video}")
+    print(f"  Data:  {output_data}")
+
+    if progress_callback:
+        progress_callback("tracking", 1.0)
 
     # --- Stats ---
     all_track_ids = set()

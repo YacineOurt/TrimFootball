@@ -23,8 +23,11 @@ step1_tracking/*.jpg
 step1_tracking/*.mp4
 step2_homography/*.jpg
 step2_homography/*.npy
-step3_metrics/__pycache__/
 # docs/ kept for README screenshots
+
+# Database & uploaded matches
+trimfootball.db
+matches/
 
 # Zone.Identifier (WSL artifacts)
 *:Zone.Identifier
