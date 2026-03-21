@@ -24,7 +24,7 @@ step1_tracking/*.mp4
 step2_homography/*.jpg
 step2_homography/*.npy
 step3_metrics/__pycache__/
-docs/
+# docs/ kept for README screenshots
 
 # Zone.Identifier (WSL artifacts)
 *:Zone.Identifier
