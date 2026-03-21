@@ -1,0 +1,30 @@
+.venv/
+uploads/
+output/
+__pycache__/
+*.pyc
+node_modules/
+.next/
+dist/
+
+# Videos & large files
+*.mp4
+*.avi
+*.mov
+tracking_data.json
+
+# YOLO models
+models/
+
+# Debug & generated images
+debug/
+cas1/
+step1_tracking/*.jpg
+step1_tracking/*.mp4
+step2_homography/*.jpg
+step2_homography/*.npy
+step3_metrics/__pycache__/
+docs/
+
+# Zone.Identifier (WSL artifacts)
+*:Zone.Identifier
