@@ -1,350 +1,285 @@
 """
-Step 2: Homography estimation via optimization
-- Detects white pitch lines in the Veo frame
-- Optimizes a homography to align a pitch model with detected lines
-- Projects player positions from tracking data onto a 2D pitch view
+Step 2: Per-frame homography via pitch keypoint detection
+- Uses a YOLOv8-pose model to detect 32 pitch keypoints per frame
+- Computes homography per frame using cv2.findHomography (RANSAC)
+- Projects player/ball positions from tracking data onto pitch coordinates
+- Falls back to previous frame's homography when detection is insufficient
 """
 
 import cv2
 import json
 import numpy as np
 from pathlib import Path
-from scipy.optimize import minimize
+from ultralytics import YOLO
 
 # --- Paths ---
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = SCRIPT_DIR.parent
 
-# --- Pitch model (meters) ---
-PITCH_L = 105.0
-PITCH_W = 68.0
-HALF = 52.5
-PEN_D = 16.5
-PEN_W = 40.32
-GOAL_W = 7.32
-GA_D = 5.5
-GA_W = 18.32
-CR = 9.15  # center circle radius
+KEYPOINT_MODEL = str(PROJECT_DIR / "models/pitch_keypoints/football-pitch-detection.pt")
 
-def get_pitch_lines():
-    """Return list of (start, end) pitch line segments in meters."""
-    lines = []
-    # Touchlines
-    lines.append(((0, 0), (PITCH_L, 0)))          # far
-    lines.append(((0, PITCH_W), (PITCH_L, PITCH_W)))  # near
-    # Goal lines
-    lines.append(((0, 0), (0, PITCH_W)))
-    lines.append(((PITCH_L, 0), (PITCH_L, PITCH_W)))
-    # Halfway
-    lines.append(((HALF, 0), (HALF, PITCH_W)))
-    # Left penalty area
-    py1, py2 = (PITCH_W - PEN_W) / 2, (PITCH_W + PEN_W) / 2
-    lines += [((0, py1), (PEN_D, py1)), ((0, py2), (PEN_D, py2)),
-              ((PEN_D, py1), (PEN_D, py2))]
-    # Right penalty area
-    lines += [((PITCH_L, py1), (PITCH_L - PEN_D, py1)),
-              ((PITCH_L, py2), (PITCH_L - PEN_D, py2)),
-              ((PITCH_L - PEN_D, py1), (PITCH_L - PEN_D, py2))]
-    # Left goal area
-    gy1, gy2 = (PITCH_W - GA_W) / 2, (PITCH_W + GA_W) / 2
-    lines += [((0, gy1), (GA_D, gy1)), ((0, gy2), (GA_D, gy2)),
-              ((GA_D, gy1), (GA_D, gy2))]
-    # Right goal area
-    lines += [((PITCH_L, gy1), (PITCH_L - GA_D, gy1)),
-              ((PITCH_L, gy2), (PITCH_L - GA_D, gy2)),
-              ((PITCH_L - GA_D, gy1), (PITCH_L - GA_D, gy2))]
-    # Center circle
-    angles = np.linspace(0, 2 * np.pi, 64)
-    for i in range(len(angles) - 1):
-        p1 = (HALF + CR * np.cos(angles[i]), PITCH_W / 2 + CR * np.sin(angles[i]))
-        p2 = (HALF + CR * np.cos(angles[i + 1]), PITCH_W / 2 + CR * np.sin(angles[i + 1]))
-        lines.append((p1, p2))
-    return lines
+# --- Pitch dimensions (meters) ---
+PITCH_L, PITCH_W = 105.0, 68.0
+PEN_D, PEN_W = 16.5, 40.32
+GA_D, GA_W = 5.5, 18.32
+CR = 9.15
+PENALTY_SPOT = 11.0
+
+pen_y1 = (PITCH_W - PEN_W) / 2   # 13.84
+pen_y2 = (PITCH_W + PEN_W) / 2   # 54.16
+ga_y1 = (PITCH_W - GA_W) / 2     # 24.84
+ga_y2 = (PITCH_W + GA_W) / 2     # 43.16
+mid_x = PITCH_L / 2              # 52.5
+mid_y = PITCH_W / 2              # 34.0
+
+# 32 keypoints: index → (x_meters, y_meters) on the pitch
+# x = 0 → left goal line, x = 105 → right goal line
+# y = 0 → far touchline, y = 68 → near touchline
+KEYPOINT_PITCH_COORDS = [
+    (0.0, 0.0),                          # 0:  corner far-left
+    (0.0, pen_y1),                        # 1:  left penalty area far
+    (0.0, ga_y1),                         # 2:  left goal post far
+    (0.0, ga_y2),                         # 3:  left goal post near
+    (0.0, pen_y2),                        # 4:  left penalty area near
+    (0.0, PITCH_W),                       # 5:  corner near-left
+    (GA_D, ga_y1),                        # 6:  left goal area far corner
+    (GA_D, ga_y2),                        # 7:  left goal area near corner
+    (PENALTY_SPOT, mid_y),                # 8:  left penalty spot
+    (PEN_D, pen_y1),                      # 9:  left pen area far-outer
+    (PEN_D, ga_y1),                       # 10: left pen area far-inner
+    (PEN_D, ga_y2),                       # 11: left pen area near-inner
+    (PEN_D, pen_y2),                      # 12: left pen area near-outer
+    (mid_x, 0.0),                         # 13: halfway × far touchline
+    (mid_x, mid_y - CR),                  # 14: center circle far
+    (mid_x, mid_y + CR),                  # 15: center circle near
+    (mid_x, PITCH_W),                     # 16: halfway × near touchline
+    (PITCH_L - PEN_D, pen_y1),            # 17: right pen area far-outer
+    (PITCH_L - PEN_D, ga_y1),             # 18: right pen area far-inner
+    (PITCH_L - PEN_D, ga_y2),             # 19: right pen area near-inner
+    (PITCH_L - PEN_D, pen_y2),            # 20: right pen area near-outer
+    (PITCH_L - PENALTY_SPOT, mid_y),      # 21: right penalty spot
+    (PITCH_L - GA_D, ga_y1),              # 22: right goal area far corner
+    (PITCH_L - GA_D, ga_y2),              # 23: right goal area near corner
+    (PITCH_L, 0.0),                       # 24: corner far-right
+    (PITCH_L, pen_y1),                    # 25: right penalty area far
+    (PITCH_L, ga_y1),                     # 26: right goal post far
+    (PITCH_L, ga_y2),                     # 27: right goal post near
+    (PITCH_L, pen_y2),                    # 28: right penalty area near
+    (PITCH_L, PITCH_W),                   # 29: corner near-right
+    (mid_x - CR, mid_y),                  # 30: center circle left
+    (mid_x + CR, mid_y),                  # 31: center circle right
+]
+
+MIN_KEYPOINTS = 4
+CONFIDENCE_THRESHOLD = 0.5
 
 
-def params_to_H(params):
-    """Convert 8 optimization params to 3x3 homography (h33=1)."""
-    H = np.array([
-        [params[0], params[1], params[2]],
-        [params[3], params[4], params[5]],
-        [params[6], params[7], 1.0]
-    ])
-    return H
+def detect_keypoints(model, frame):
+    """Detect pitch keypoints in a frame. Returns (pixel_pts, pitch_pts) arrays."""
+    results = model(frame, verbose=False)
+
+    if results[0].keypoints is None:
+        return None, None
+
+    kps = results[0].keypoints
+    xy = kps.xy[0].cpu().numpy()
+    conf = kps.conf[0].cpu().numpy() if kps.conf is not None else np.ones(len(xy))
+
+    pixel_pts = []
+    pitch_pts = []
+
+    for i, (pt, c) in enumerate(zip(xy, conf)):
+        if c >= CONFIDENCE_THRESHOLD and i < len(KEYPOINT_PITCH_COORDS):
+            px, py = pt[0], pt[1]
+            if px > 0 and py > 0:  # valid detection
+                pixel_pts.append([px, py])
+                pitch_pts.append(KEYPOINT_PITCH_COORDS[i])
+
+    if len(pixel_pts) < MIN_KEYPOINTS:
+        return None, None
+
+    return np.array(pixel_pts, dtype=np.float32), np.array(pitch_pts, dtype=np.float32)
 
 
-def project_pitch_to_image(H_inv, px, py):
-    """Project pitch (m) to image (px)."""
-    pt = np.array([px, py, 1.0])
-    r = H_inv @ pt
-    if abs(r[2]) < 1e-10:
+def compute_homography(pixel_pts, pitch_pts):
+    """Compute homography from pixel to pitch coordinates using RANSAC."""
+    H, mask = cv2.findHomography(pixel_pts, pitch_pts, cv2.RANSAC, 5.0)
+    if H is None:
         return None
-    return r[0] / r[2], r[1] / r[2]
-
-
-def rasterize_pitch_lines(H_inv, w, h, pitch_lines):
-    """Render pitch lines onto an image using H_inv (pitch->image)."""
-    mask = np.zeros((h, w), dtype=np.uint8)
-    for (x1, y1), (x2, y2) in pitch_lines:
-        p1 = project_pitch_to_image(H_inv, x1, y1)
-        p2 = project_pitch_to_image(H_inv, x2, y2)
-        if p1 is None or p2 is None:
-            continue
-        ix1, iy1 = int(round(p1[0])), int(round(p1[1]))
-        ix2, iy2 = int(round(p2[0])), int(round(p2[1]))
-        # Clip to image bounds with margin
-        if (ix1 < -500 or ix1 > w + 500 or iy1 < -500 or iy1 > h + 500 or
-                ix2 < -500 or ix2 > w + 500 or iy2 < -500 or iy2 > h + 500):
-            continue
-        cv2.line(mask, (ix1, iy1), (ix2, iy2), 255, 3)
-    return mask
-
-
-def alignment_score(params, white_mask, pitch_lines, w, h):
-    """Negative overlap between projected pitch lines and detected white pixels."""
-    H = params_to_H(params)
-    try:
-        H_inv = np.linalg.inv(H)
-    except np.linalg.LinAlgError:
-        return 1e6
-
-    projected = rasterize_pitch_lines(H_inv, w, h, pitch_lines)
-    # Overlap: count white pixels that fall on projected lines (use int64 to avoid overflow)
-    overlap = cv2.bitwise_and(projected, white_mask)
-    overlap_count = np.count_nonzero(overlap)
-    # Also penalize projected pixels that DON'T hit white (false positives)
-    projected_count = np.count_nonzero(projected)
-    if projected_count == 0:
-        return 1e6
-    # Score: maximize overlap, penalize false positives
-    precision = overlap_count / max(projected_count, 1)
-    recall = overlap_count / max(np.count_nonzero(white_mask), 1)
-    if precision + recall == 0:
-        return 1e6
-    f1 = 2 * precision * recall / (precision + recall)
-    return -f1
-
-
-def detect_white_lines(frame):
-    """Detect white pitch line pixels."""
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    white = cv2.inRange(hsv, (0, 0, 160), (180, 55, 255))
-
-    # Only keep pitch area (green region)
-    green = cv2.inRange(hsv, (25, 15, 30), (95, 255, 255))
-    # Dilate green to include line pixels surrounded by grass
-    green_dilated = cv2.dilate(green, np.ones((25, 25), np.uint8))
-    white_on_pitch = cv2.bitwise_and(white, green_dilated)
-
-    # Remove large blobs (snow, advertising) - keep thin structures
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    white_on_pitch = cv2.morphologyEx(white_on_pitch, cv2.MORPH_OPEN, kernel)
-
-    return white_on_pitch
-
-
-def compute_initial_H():
-    """Compute initial homography guess from the most confident correspondences."""
-    pts_pixel = np.array([
-        [250, 248],      # far-left corner (goal line x far touchline)
-        [1850, 235],     # far-right corner
-        [1920, 1070],    # near-right corner
-        [50, 1060],      # near-left corner
-    ], dtype=np.float32)
-
-    pts_pitch = np.array([
-        [0, 0],
-        [105, 0],
-        [105, 68],
-        [0, 68],
-    ], dtype=np.float32)
-
-    H, _ = cv2.findHomography(pts_pixel, pts_pitch)
+    # Sanity check: project a few points and verify they're on the pitch
+    projected = cv2.perspectiveTransform(pixel_pts.reshape(-1, 1, 2), H).reshape(-1, 2)
+    in_bounds = sum(1 for p in projected if -10 <= p[0] <= PITCH_L + 10 and -10 <= p[1] <= PITCH_W + 10)
+    if in_bounds < len(projected) * 0.5:
+        return None
     return H
 
 
-def run(video_path=None, tracking_path=None, output_dir=None,
-        progress_callback=None):
+def project_point(H, px, py):
+    """Project a pixel point to pitch coordinates using homography H."""
+    pt = np.array([px, py, 1.0])
+    result = H @ pt
+    if abs(result[2]) < 1e-10:
+        return None, None
+    return round(float(result[0] / result[2]), 1), round(float(result[1] / result[2]), 1)
+
+
+def run(video_path=None, tracking_path=None, output_dir=None, progress_callback=None):
     video_path = video_path or str(PROJECT_DIR / "video2.mp4")
     tracking_path = tracking_path or str(PROJECT_DIR / "tracking_data.json")
     output_dir = Path(output_dir) if output_dir else SCRIPT_DIR
 
-    cap = cv2.VideoCapture(video_path)
-    cap.set(cv2.CAP_PROP_POS_FRAMES, 270)
-    ret, frame = cap.read()
-    cap.release()
-    h, w = frame.shape[:2]
+    print("Loading pitch keypoint model...")
+    model = YOLO(KEYPOINT_MODEL)
 
-    if progress_callback:
-        progress_callback("homography", 0.1)
-
-    print("1. Detecting white pitch lines...")
-    white_mask = detect_white_lines(frame)
-    cv2.imwrite(str(output_dir / "white_mask_clean.jpg"), white_mask)
-    print(f"   White pixels: {(white_mask > 0).sum()}")
-
-    print("2. Computing initial homography guess...")
-    H_init = compute_initial_H()
-    params_init = [
-        H_init[0, 0], H_init[0, 1], H_init[0, 2],
-        H_init[1, 0], H_init[1, 1], H_init[1, 2],
-        H_init[2, 0], H_init[2, 1],
-    ]
-
-    pitch_lines = get_pitch_lines()
-
-    # Verify initial guess
-    H_inv_init = np.linalg.inv(H_init)
-    score_init = alignment_score(params_init, white_mask, pitch_lines, w, h)
-    print(f"   Initial score: {score_init:.0f}")
-
-    # Draw initial guess
-    vis_init = frame.copy()
-    proj_init = rasterize_pitch_lines(H_inv_init, w, h, pitch_lines)
-    vis_init[proj_init > 0] = [0, 255, 0]
-    cv2.imwrite(str(output_dir / "homography_initial.jpg"), vis_init)
-
-    if progress_callback:
-        progress_callback("homography", 0.3)
-
-    print("3. Optimizing homography...")
-    # Use Powell method which handles this type of problem better
-    result = minimize(
-        alignment_score,
-        params_init,
-        args=(white_mask, pitch_lines, w, h),
-        method="Powell",
-        options={"maxiter": 10000, "ftol": 1e-6},
-    )
-    print(f"   Optimization: success={result.success}, score={result.fun:.4f}")
-    print(f"   Iterations: {result.nit}")
-
-    # Try Nelder-Mead from the Powell result for fine-tuning
-    result2 = minimize(
-        alignment_score,
-        result.x,
-        args=(white_mask, pitch_lines, w, h),
-        method="Nelder-Mead",
-        options={"maxiter": 10000, "xatol": 1e-10, "fatol": 1e-6, "adaptive": True},
-    )
-    if result2.fun < result.fun:
-        result = result2
-        print(f"   Nelder-Mead improved: score={result.fun:.4f}")
-
-    H_opt = params_to_H(result.x)
-    H_inv_opt = np.linalg.inv(H_opt)
-
-    # Draw optimized result
-    vis_opt = frame.copy()
-    proj_opt = rasterize_pitch_lines(H_inv_opt, w, h, pitch_lines)
-    vis_opt[proj_opt > 0] = [0, 255, 0]
-    cv2.imwrite(str(output_dir / "homography_optimized.jpg"), vis_opt)
-
-    # Save homography
-    np.save(str(output_dir / "homography.npy"), H_opt)
-
-    if progress_callback:
-        progress_callback("homography", 0.7)
-
-    print("4. Projecting tracking data onto 2D pitch...")
+    print("Loading tracking data...")
     with open(tracking_path) as f:
         tracking = json.load(f)
 
-    # Project player positions (center-bottom of bbox = feet position)
-    for fd in tracking["frames"]:
+    cap = cv2.VideoCapture(video_path)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    print(f"Video: {total_frames} frames")
+
+    last_good_H = None
+    homography_stats = {"good": 0, "fallback": 0, "failed": 0}
+
+    for frame_idx in range(total_frames):
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        # Detect keypoints and compute homography
+        pixel_pts, pitch_pts = detect_keypoints(model, frame)
+
+        H = None
+        if pixel_pts is not None:
+            H = compute_homography(pixel_pts, pitch_pts)
+
+        if H is not None:
+            last_good_H = H
+            homography_stats["good"] += 1
+        elif last_good_H is not None:
+            H = last_good_H
+            homography_stats["fallback"] += 1
+        else:
+            homography_stats["failed"] += 1
+
+        # Project player positions
+        fd = tracking["frames"][frame_idx]
         for p in fd["players"]:
             x1, y1, x2, y2 = p["bbox"]
             feet_x = (x1 + x2) / 2
             feet_y = y2  # bottom of bbox = feet
-            pt = np.array([feet_x, feet_y, 1.0])
-            result_pt = H_opt @ pt
-            if abs(result_pt[2]) > 1e-10:
-                px = result_pt[0] / result_pt[2]
-                py = result_pt[1] / result_pt[2]
-                p["pitch_x"] = round(float(px), 1)
-                p["pitch_y"] = round(float(py), 1)
+
+            if H is not None:
+                px, py = project_point(H, feet_x, feet_y)
+                p["pitch_x"] = px
+                p["pitch_y"] = py
             else:
                 p["pitch_x"] = None
                 p["pitch_y"] = None
 
-        if fd["ball"]:
+        # Project ball
+        if fd.get("ball"):
             bx = (fd["ball"]["bbox"][0] + fd["ball"]["bbox"][2]) / 2
             by = (fd["ball"]["bbox"][1] + fd["ball"]["bbox"][3]) / 2
-            pt = np.array([bx, by, 1.0])
-            result_pt = H_opt @ pt
-            if abs(result_pt[2]) > 1e-10:
-                fd["ball"]["pitch_x"] = round(float(result_pt[0] / result_pt[2]), 1)
-                fd["ball"]["pitch_y"] = round(float(result_pt[1] / result_pt[2]), 1)
+            if H is not None:
+                px, py = project_point(H, bx, by)
+                fd["ball"]["pitch_x"] = px
+                fd["ball"]["pitch_y"] = py
 
+        if frame_idx % 50 == 0:
+            n_kp = len(pixel_pts) if pixel_pts is not None else 0
+            status = "OK" if pixel_pts is not None and compute_homography(pixel_pts, pitch_pts) is not None else "fallback"
+            print(f"  Frame {frame_idx}/{total_frames}: {n_kp} keypoints — {status}")
+
+        if progress_callback and frame_idx % 20 == 0:
+            progress_callback("homography", frame_idx / total_frames)
+
+    cap.release()
+
+    # Save tracking data
     with open(tracking_path, "w") as f:
         json.dump(tracking, f)
 
-    # 5. Draw one frame on 2D pitch
-    print("5. Drawing 2D pitch view...")
-    draw_2d_pitch(tracking["frames"][270], output_dir)
+    # Save debug visualization for a few frames
+    _save_debug_frames(video_path, tracking, output_dir)
 
     if progress_callback:
         progress_callback("homography", 1.0)
 
-    print("\nDone! Files:")
-    print(f"  {output_dir / 'homography_initial.jpg'}  - initial guess overlay")
-    print(f"  {output_dir / 'homography_optimized.jpg'} - optimized overlay")
-    print(f"  {output_dir / 'pitch_2d.jpg'}            - 2D tactical view")
-    print(f"  {output_dir / 'homography.npy'}          - saved homography matrix")
-    print(f"  {tracking_path}                           - updated with pitch coordinates")
+    total = sum(homography_stats.values())
+    print(f"\nDone! Homography stats:")
+    print(f"  Good:     {homography_stats['good']}/{total} ({100*homography_stats['good']/max(total,1):.0f}%)")
+    print(f"  Fallback: {homography_stats['fallback']}/{total}")
+    print(f"  Failed:   {homography_stats['failed']}/{total}")
+    print(f"  Tracking: {tracking_path}")
 
 
-def draw_2d_pitch(frame_data, output_dir=None):
+def _save_debug_frames(video_path, tracking, output_dir):
+    """Save a few debug images showing projected positions on 2D pitch."""
+    output_dir = Path(output_dir)
+    cap = cv2.VideoCapture(video_path)
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    debug_frames = [0, total // 4, total // 2, 3 * total // 4, total - 1]
+
+    for fidx in debug_frames:
+        if fidx >= len(tracking["frames"]):
+            continue
+        fd = tracking["frames"][fidx]
+        img = _draw_2d_pitch(fd)
+        cv2.imwrite(str(output_dir / f"pitch_2d_frame_{fidx}.jpg"), img)
+
+    cap.release()
+    print(f"  Debug images saved to {output_dir}/pitch_2d_frame_*.jpg")
+
+
+def _draw_2d_pitch(frame_data):
     """Draw players on a 2D pitch diagram."""
-    output_dir = Path(output_dir) if output_dir else SCRIPT_DIR
-
-    # Pitch image: 10px per meter
     scale = 10
     pw, ph = int(PITCH_L * scale), int(PITCH_W * scale)
     margin = 30
-    img = np.ones((ph + 2 * margin, pw + 2 * margin, 3), dtype=np.uint8) * 40  # dark bg
+    img = np.ones((ph + 2 * margin, pw + 2 * margin, 3), dtype=np.uint8) * 40
 
     def m2px(mx, my):
         return int(mx * scale + margin), int(my * scale + margin)
 
-    # Draw pitch surface
+    # Pitch surface
     cv2.rectangle(img, m2px(0, 0), m2px(PITCH_L, PITCH_W), (34, 120, 34), -1)
-
-    # Draw lines
     WHITE = (255, 255, 255)
-    for (x1, y1), (x2, y2) in get_pitch_lines():
-        cv2.line(img, m2px(x1, y1), m2px(x2, y2), WHITE, 1)
 
-    # Draw center circle
-    cv2.circle(img, m2px(HALF, PITCH_W / 2), int(CR * scale), WHITE, 1)
+    # Outline
+    cv2.rectangle(img, m2px(0, 0), m2px(PITCH_L, PITCH_W), WHITE, 1)
+    # Halfway
+    cv2.line(img, m2px(mid_x, 0), m2px(mid_x, PITCH_W), WHITE, 1)
+    # Center circle
+    cv2.circle(img, m2px(mid_x, mid_y), int(CR * scale), WHITE, 1)
+    # Penalty areas
+    cv2.rectangle(img, m2px(0, pen_y1), m2px(PEN_D, pen_y2), WHITE, 1)
+    cv2.rectangle(img, m2px(PITCH_L - PEN_D, pen_y1), m2px(PITCH_L, pen_y2), WHITE, 1)
+    # Goal areas
+    cv2.rectangle(img, m2px(0, ga_y1), m2px(GA_D, ga_y2), WHITE, 1)
+    cv2.rectangle(img, m2px(PITCH_L - GA_D, ga_y1), m2px(PITCH_L, ga_y2), WHITE, 1)
 
     TEAM_COLORS = {0: (255, 100, 50), 1: (50, 100, 255), -1: (200, 200, 200)}
 
-    # Draw players
     for p in frame_data["players"]:
         if p.get("pitch_x") is None:
             continue
         px, py = p["pitch_x"], p["pitch_y"]
         if 0 <= px <= PITCH_L and 0 <= py <= PITCH_W:
-            color = TEAM_COLORS.get(p["team"], (200, 200, 200))
+            color = TEAM_COLORS.get(p.get("team", -1), (200, 200, 200))
             sx, sy = m2px(px, py)
             cv2.circle(img, (sx, sy), 6, color, -1)
             cv2.circle(img, (sx, sy), 6, WHITE, 1)
 
-            label = f"#{p['track_id']}"
-            if p["class"] == "goalkeeper":
-                label = "GK"
-            elif p["class"] == "referee":
-                label = "REF"
-            cv2.putText(img, label, (sx + 8, sy + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.3, WHITE, 1)
-
-    # Draw ball
     if frame_data.get("ball") and frame_data["ball"].get("pitch_x"):
         bx, by = frame_data["ball"]["pitch_x"], frame_data["ball"]["pitch_y"]
         if 0 <= bx <= PITCH_L and 0 <= by <= PITCH_W:
             sx, sy = m2px(bx, by)
             cv2.circle(img, (sx, sy), 4, (0, 255, 255), -1)
 
-    cv2.imwrite(str(output_dir / "pitch_2d.jpg"), img)
+    return img
 
 
 if __name__ == "__main__":
